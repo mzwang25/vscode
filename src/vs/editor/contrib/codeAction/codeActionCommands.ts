@@ -4,19 +4,21 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { IAnchor } from 'vs/base/browser/ui/contextview/contextview';
+import { CancelablePromise, createCancelablePromise } from 'vs/base/common/async';
 import { CancellationToken } from 'vs/base/common/cancellation';
 import { IJSONSchema } from 'vs/base/common/jsonSchema';
 import { KeyCode, KeyMod } from 'vs/base/common/keyCodes';
 import { Lazy } from 'vs/base/common/lazy';
 import { Disposable } from 'vs/base/common/lifecycle';
 import { escapeRegExpCharacters } from 'vs/base/common/strings';
+import { generateUuid } from 'vs/base/common/uuid';
 import { ICodeEditor } from 'vs/editor/browser/editorBrowser';
 import { EditorAction, EditorCommand, ServicesAccessor } from 'vs/editor/browser/editorExtensions';
 import { IBulkEditService, ResourceEdit } from 'vs/editor/browser/services/bulkEditService';
 import { IPosition } from 'vs/editor/common/core/position';
 import { IEditorContribution } from 'vs/editor/common/editorCommon';
 import { EditorContextKeys } from 'vs/editor/common/editorContextKeys';
-import { CodeActionTriggerType } from 'vs/editor/common/modes';
+import { CodeActionTriggerType, CopyPasteActionProvider, CopyPasteActionProviderRegistry } from 'vs/editor/common/modes';
 import { codeActionCommandId, CodeActionItem, CodeActionSet, fixAllCommandId, organizeImportsCommandId, refactorCommandId, sourceActionCommandId } from 'vs/editor/contrib/codeAction/codeAction';
 import { CodeActionUi } from 'vs/editor/contrib/codeAction/codeActionUi';
 import { MessageController } from 'vs/editor/contrib/message/messageController';
@@ -65,6 +67,11 @@ const argsSchema: IJSONSchema = {
 	}
 };
 
+let clipboardItem: undefined | {
+	readonly handle: string;
+	readonly results: CancelablePromise<Map<CopyPasteActionProvider, unknown | undefined>>;
+};
+
 export class QuickFixController extends Disposable implements IEditorContribution {
 
 	public static readonly ID = 'editor.contrib.quickFixController';
@@ -83,12 +90,91 @@ export class QuickFixController extends Disposable implements IEditorContributio
 		@IContextKeyService contextKeyService: IContextKeyService,
 		@IEditorProgressService progressService: IEditorProgressService,
 		@IInstantiationService private readonly _instantiationService: IInstantiationService,
+		@IBulkEditService private readonly _bulkEditService: IBulkEditService,
 	) {
 		super();
 
 		this._editor = editor;
 		this._model = this._register(new CodeActionModel(this._editor, markerService, contextKeyService, progressService));
 		this._register(this._model.onDidChangeState(newState => this.update(newState)));
+
+		document.addEventListener('copy', e => {
+			if (!e.clipboardData) {
+				return;
+			}
+
+			const model = editor.getModel();
+			const selection = this._editor.getSelection();
+			if (!model || !selection) {
+				return;
+			}
+
+			const providers = CopyPasteActionProviderRegistry.all(model).filter(x => !!x.onDidCopy);
+			if (!providers.length) {
+				return;
+			}
+
+			// Call prevent default to prevent our new clipboard data from being overwritten (is this really required?)
+			e.preventDefault();
+
+			// And then fill in raw text again since we prevented default
+			const clipboardText = model.getValueInRange(selection);
+			e.clipboardData.setData('text/plain', clipboardText);
+
+			// Save off a handle pointing to data that VS Code maintains.
+			const handle = generateUuid();
+			e.clipboardData.setData('x-vscode/id', handle);
+
+			const promise = createCancelablePromise(async token => {
+				const results = await Promise.all(providers.map(async provider => {
+					const result = await provider.onDidCopy!(model, selection, { text: clipboardText }, token);
+					return { provider, result };
+				}));
+
+				const map = new Map<CopyPasteActionProvider, unknown | undefined>();
+				for (const { provider, result } of results) {
+					map.set(provider, result);
+				}
+
+				return map;
+			});
+
+			clipboardItem = { handle: handle, results: promise };
+		});
+
+		document.addEventListener('paste', async e => {
+			const model = editor.getModel();
+			const selection = this._editor.getSelection();
+			if (!model || !selection) {
+				return;
+			}
+
+			const providers = CopyPasteActionProviderRegistry.all(model).filter(x => !!x.onDidCopy);
+			if (!providers.length) {
+				return;
+			}
+
+			const handle = e.clipboardData?.getData('x-vscode/id');
+			const clipboardText = e.clipboardData?.getData('text/plain') ?? '';
+
+			e.preventDefault();
+			e.stopImmediatePropagation();
+
+			let results: Map<CopyPasteActionProvider, unknown | undefined> | undefined;
+			if (handle && clipboardItem?.handle === handle) {
+				results = await clipboardItem.results;
+			}
+
+			for (const provider of providers) {
+				const data = results?.get(provider);
+				const edit = await provider.onWillPaste(model, selection, { text: clipboardText, data });
+				if (!edit) {
+					continue;
+				}
+
+				await this._bulkEditService.apply(ResourceEdit.convert(edit), { editor });
+			}
+		}, true);
 
 		this._ui = new Lazy(() =>
 			this._register(new CodeActionUi(editor, QuickFixAction.Id, AutoFixAction.Id, {
