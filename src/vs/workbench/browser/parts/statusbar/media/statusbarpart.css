@@ -69,6 +69,7 @@
 
 .monaco-workbench .part.statusbar > .items-container > .statusbar-item.left.first-visible-item {
 	padding-left: 7px; /* Add padding to the most left status bar item */
+	width: 20px
 }
 
 .monaco-workbench .part.statusbar > .items-container > .statusbar-item.right.last-visible-item {
@@ -85,8 +86,8 @@
 .monaco-workbench .part.statusbar > .items-container > .statusbar-item.has-background-color > :first-child {
 	margin-right: 0;
 	margin-left: 0;
-	padding-left: 10px;
-	padding-right: 10px;
+	padding-left: 3px;
+	padding-right: 0px;
 }
 
 .monaco-workbench .part.statusbar > .items-container > .statusbar-item > a {
